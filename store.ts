@@ -84,35 +84,27 @@ export function decodePktLines(body: Buffer): { packets: PktPacket[]; offset: nu
 // inflateSync ignores trailing bytes, so inflate once, then scan for the checksum bytes.
 // ---------------------------------------------------------------------------------------------
 
-function adler32(data: Uint8Array): number {
-  let a = 1;
-  let b = 0;
-  for (let i = 0; i < data.length; i += 1) {
-    a = (a + data[i]!) % 65521;
-    b = (b + a) % 65521;
-  }
-  return ((b << 16) | a) >>> 0;
-}
-
 export function findZlibEnd(buffer: Buffer, start: number): { end: number; data: Buffer } {
-  const data = inflateSync(buffer.subarray(start));
-  const checksum = adler32(data);
-  const needle = Buffer.alloc(4);
-  needle.writeUInt32BE(checksum, 0);
-  // The checksum is the stream's last 4 bytes; the first occurrence at or after start+2
-  // is the end (a false positive inside deflate data is ~2^-32 per position, and the
-  // slice is verified by re-inflating exactly to the candidate end).
-  for (let pos = start + 2; pos + 4 <= buffer.length; pos += 1) {
-    if (buffer[pos] === needle[0] && buffer[pos + 1] === needle[1] && buffer[pos + 2] === needle[2] && buffer[pos + 3] === needle[3]) {
-      const end = pos + 4;
-      try {
-        if (inflateSync(buffer.subarray(start, end)).equals(data)) return { end, data };
-      } catch {
-        // Not a real stream end; keep scanning.
-      }
-    }
+  // One inflate: zlib itself stops at the stream end, and `info: true` exposes the
+  // engine's consumed-input count (bytesWritten), which is the exact stream length.
+  // No Adler-32 scan, no second inflate to verify: zlib validates the trailing
+  // Adler-32 checksum during inflation and throws on a corrupt/truncated stream,
+  // exactly the error readPack already surfaces as an unpack failure.
+  const { buffer: data, engine } = inflateSync(buffer.subarray(start), { info: true });
+  // Defense-in-depth (GPT review-2 §2): bytesWritten is set from consumed input
+  // by zlib on Node 22/26, but never trust it blindly — an invalid value must
+  // fail the receive-pack loudly, never silently guess an end and corrupt every
+  // subsequent object in the pack.
+  const bytesWritten = engine?.bytesWritten;
+  if (
+    typeof bytesWritten !== 'number' ||
+    !Number.isInteger(bytesWritten) ||
+    bytesWritten <= 0 ||
+    bytesWritten > buffer.length - start
+  ) {
+    throw new Error('could not find the end of a zlib stream');
   }
-  throw new Error('could not find the end of a zlib stream');
+  return { end: start + bytesWritten, data };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -127,7 +119,22 @@ export interface ParsedCommit {
   readonly message: string;
 }
 
+// Git object data is immutable once stored, so parsed commits/trees can be
+// memoized by buffer identity. The caches are module-level WeakMaps: they hold
+// no reference from any exported state (state.json is unaffected), entries die
+// with their buffer, and every caller treats the results as read-only.
+const parsedCommitCache = new WeakMap<Buffer, ParsedCommit>();
+const parsedTreeCache = new WeakMap<Buffer, TreeEntry[]>();
+
 export function parseCommit(data: Buffer): ParsedCommit {
+  const cached = parsedCommitCache.get(data);
+  if (cached) return cached;
+  const parsed = parseCommitUncached(data);
+  parsedCommitCache.set(data, parsed);
+  return parsed;
+}
+
+function parseCommitUncached(data: Buffer): ParsedCommit {
   const text = data.toString('utf8');
   const blank = text.indexOf('\n\n');
   const header = blank >= 0 ? text.slice(0, blank) : text;
@@ -152,6 +159,14 @@ export interface TreeEntry {
 }
 
 export function parseTree(data: Buffer): TreeEntry[] {
+  const cached = parsedTreeCache.get(data);
+  if (cached) return cached;
+  const parsed = parseTreeUncached(data);
+  parsedTreeCache.set(data, parsed);
+  return parsed;
+}
+
+function parseTreeUncached(data: Buffer): TreeEntry[] {
   const entries: TreeEntry[] = [];
   let offset = 0;
   while (offset < data.length) {

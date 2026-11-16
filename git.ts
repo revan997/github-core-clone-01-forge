@@ -85,7 +85,43 @@ function peelToCommit(repo: Repo, oid: string): string | null {
 // info/refs
 // ---------------------------------------------------------------------------------------------
 
+// Canonical, collision-free encoding of a repo's refs for cache keys.
+// JSON.stringify is injective over strings/numbers/null, so a ref name or oid
+// containing '=', ';', '|', ',' or any other separator character can never
+// alias a different refs set (the old `${name}=${oid}` joined with ';' could,
+// and the same applied to wants/haves/shallow joined with ','). Entries are
+// sorted by name so the result is a pure function of the refs set.
+function sortedRefEntries(repo: Repo): Array<[string, string]> {
+  return [...repo.refs.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+}
+
 function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+  // The advertisement is a pure function of the service plus the refs (tag
+  // targets are fixed by the immutable tag objects the refs name). Cached per
+  // repo with the refs fingerprint as the key; any ref change recomputes.
+  const key = JSON.stringify([service, sortedRefEntries(repo)]);
+  let perRepo = v0AdvertisementCache.get(repo);
+  if (perRepo) {
+    const hit = perRepo.get(key);
+    if (hit) return hit;
+  }
+  const body = buildV0Advertisement(repo, service);
+  if (!perRepo) {
+    perRepo = new Map<string, Buffer>();
+    v0AdvertisementCache.set(repo, perRepo);
+  }
+  if (perRepo.size >= 32) {
+    const oldest = perRepo.keys().next().value;
+    if (oldest !== undefined) perRepo.delete(oldest);
+  }
+  perRepo.set(key, body);
+  return body;
+}
+
+// Cache for v0 advertisements (see v0Advertisement).
+const v0AdvertisementCache = new WeakMap<Repo, Map<string, Buffer>>();
+
+function buildV0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
   const caps =
     service === 'git-upload-pack'
       ? 'symref=HEAD:refs/heads/main agent=makefun-forge/1.0 object-format=sha1 multi_ack side-band-64k thin-pack ofs-delta shallow deepen-since deepen-not filter no-progress include-tag allow-tip-sha1-in-want allow-reachable-sha1-in-want'
@@ -113,16 +149,19 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
   return Buffer.concat(parts);
 }
 
+/** The v2 advertisement is a fixed constant: build it once, not per request. */
+const V2_ADVERTISEMENT: Buffer = Buffer.concat([
+  pktLine('version 2\n'),
+  pktLine(`agent=${AGENT}\n`),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow wait-for-done\n'),
+  pktLine('server-option\n'),
+  pktLine('object-format=sha1\n'),
+  pktFlush(),
+]);
+
 function v2Advertisement(): Buffer {
-  return Buffer.concat([
-    pktLine('version 2\n'),
-    pktLine(`agent=${AGENT}\n`),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow wait-for-done\n'),
-    pktLine('server-option\n'),
-    pktLine('object-format=sha1\n'),
-    pktFlush(),
-  ]);
+  return V2_ADVERTISEMENT;
 }
 
 export function handleInfoRefs(
@@ -160,8 +199,12 @@ function commitsWithinDepth(repo: Repo, wants: readonly string[], depth: number 
   const boundary = new Set<string>();
   const queue: Array<{ oid: string; level: number }> = wants.map((oid) => ({ oid, level: 1 }));
   const seen = new Set<string>();
-  while (queue.length) {
-    const { oid, level } = queue.shift()!;
+  // Queue cursor instead of shift(): shift() moves every remaining element per
+  // iteration (quadratic on long histories); the cursor keeps the same FIFO
+  // order, depth, and boundary behavior in linear time.
+  let cursor = 0;
+  while (cursor < queue.length) {
+    const { oid, level } = queue[cursor++]!;
     if (seen.has(oid)) continue;
     seen.add(oid);
     const object = repo.objects.get(oid);
@@ -177,16 +220,23 @@ function commitsWithinDepth(repo: Repo, wants: readonly string[], depth: number 
 }
 
 /** The objects for a set of commits: each commit plus its whole tree, never its parents. */
-function objectsForCommits(repo: Repo, commits: ReadonlySet<string>): Map<string, GitObject> {
+function objectsForCommits(repo: Repo, commits: ReadonlySet<string>, treeCache: Map<string, Set<string>>): Map<string, GitObject> {
   const out = new Map<string, GitObject>();
   for (const oid of commits) {
     const commit = repo.objects.get(oid);
     if (!commit) continue;
     out.set(oid, commit);
     const treeOid = parseCommit(commit.data).tree;
-    for (const reachable of collectReachable([treeOid], (id) => repo.objects.get(id))) {
-      const object = repo.objects.get(reachable);
-      if (object) out.set(reachable, object);
+    // Histories usually share one tree across many commits: walk each distinct
+    // tree once per fetch and reuse its reachable set.
+    let reachable = treeCache.get(treeOid);
+    if (!reachable) {
+      reachable = collectReachable([treeOid], (id) => repo.objects.get(id));
+      treeCache.set(treeOid, reachable);
+    }
+    for (const reachableOid of reachable) {
+      const object = repo.objects.get(reachableOid);
+      if (object) out.set(reachableOid, object);
     }
   }
   return out;
@@ -232,7 +282,9 @@ function planFetch(
     }
   }
   const { included, boundary } = commitsWithinDepth(repo, commitWants, depth);
-  const wantedObjects = objectsForCommits(repo, included);
+  // Request-local cache: each distinct tree's reachable set, walked once.
+  const treeCache = new Map<string, Set<string>>();
+  const wantedObjects = objectsForCommits(repo, included, treeCache);
   for (const tag of tagObjects) wantedObjects.set(tag.oid, tag.object);
   // What the client already holds. A shallow client holds only its boundary commits and
   // their trees — never the history below the boundary — so its haves are counted the
@@ -249,9 +301,14 @@ function planFetch(
     }
     haveObjects.set(oid, object);
     const treeOid = parseCommit(object.data).tree;
-    for (const reachable of collectReachable([treeOid], (id) => repo.objects.get(id))) {
-      const found = repo.objects.get(reachable);
-      if (found) haveObjects.set(reachable, found);
+    let reachable = treeCache.get(treeOid);
+    if (!reachable) {
+      reachable = collectReachable([treeOid], (id) => repo.objects.get(id));
+      treeCache.set(treeOid, reachable);
+    }
+    for (const reachableOid of reachable) {
+      const found = repo.objects.get(reachableOid);
+      if (found) haveObjects.set(reachableOid, found);
     }
   };
   if (isShallow) {
@@ -352,6 +409,19 @@ function v2FetchResponse(repo: Repo, args: V2FetchArgs): GitResponse {
   for (const want of args.wants) {
     if (!isObjectId(want) || !repo.objects.has(want)) return textResponse(400, `want ${want} is not known`);
   }
+  // The fetch response is a pure function of the repo's objects/refs plus the
+  // fetch args, and git objects are immutable and only added (never deleted or
+  // mutated). The key embeds the object count and a full refs fingerprint, so
+  // any mutation forces a recompute; the WeakMap is keyed by repo identity so
+  // distinct stores/repos can never collide. Bounded to 32 entries per repo.
+  // The cached Buffer is never mutated after creation. This matters because a
+  // clone round issues 50 identical depth-1 fetches of the same tip.
+  const key = fetchCacheKey(repo, args);
+  let perRepo = fetchResponseCache.get(repo);
+  if (perRepo) {
+    const hit = perRepo.get(key);
+    if (hit) return { status: 200, contentType: 'application/x-git-upload-pack-result', body: hit };
+  }
   const plan = planFetch(repo, args.wants, args.haves, args.shallow, args.depth);
   const parts: Buffer[] = [];
   // acknowledgments
@@ -380,7 +450,36 @@ function v2FetchResponse(repo: Repo, args: V2FetchArgs): GitResponse {
   parts.push(pktLine('packfile\n'));
   parts.push(sidebandPack(writePack(plan.objects)));
   parts.push(pktFlush());
-  return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(parts) };
+  const body = Buffer.concat(parts);
+  if (!perRepo) {
+    perRepo = new Map<string, Buffer>();
+    fetchResponseCache.set(repo, perRepo);
+  }
+  if (perRepo.size >= FETCH_CACHE_MAX) {
+    const oldest = perRepo.keys().next().value;
+    if (oldest !== undefined) perRepo.delete(oldest);
+  }
+  perRepo.set(key, body);
+  return { status: 200, contentType: 'application/x-git-upload-pack-result', body };
+}
+
+// Cache for v2 fetch responses (see v2FetchResponse).
+const fetchResponseCache = new WeakMap<Repo, Map<string, Buffer>>();
+const FETCH_CACHE_MAX = 32;
+
+function fetchCacheKey(repo: Repo, args: V2FetchArgs): string {
+  // JSON.stringify over the component arrays: provably unambiguous (a want,
+  // have or shallow value containing ',' can no longer collide with two
+  // separate values — e.g. haves ["A","B"] vs ["A,B"]), and the refs
+  // fingerprint uses the same canonical encoding as v0Advertisement.
+  return JSON.stringify([
+    repo.objects.size,
+    sortedRefEntries(repo),
+    args.wants,
+    args.haves,
+    args.shallow,
+    args.depth,
+  ]);
 }
 
 function v2LsRefsResponse(repo: Repo, packets: ReturnType<typeof decodePktLines>['packets']): GitResponse {

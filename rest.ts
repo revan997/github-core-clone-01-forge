@@ -159,6 +159,20 @@ function issueJson(repo: Repo, issue: Issue): string {
   return json;
 }
 
+// The response Buffer for an issue, cached outside the issue object so exported
+// state is untouched. Reused only while the JSON text is identical; any mutation
+// clears cachedJson, issueJson rebuilds, and the text comparison misses.
+const issueBodyCache = new WeakMap<Issue, { json: string; body: Buffer }>();
+
+function issueResponseBody(repo: Repo, issue: Issue): Buffer {
+  const json = issueJson(repo, issue);
+  const cached = issueBodyCache.get(issue);
+  if (cached && cached.json === json) return cached.body;
+  const body = Buffer.from(json, 'utf8');
+  issueBodyCache.set(issue, { json, body });
+  return body;
+}
+
 function commentShape(repo: Repo, issue: Issue, comment: Comment): Record<string, unknown> {
   return {
     id: comment.dbId,
@@ -725,7 +739,7 @@ export function handleRest(ctx: RestContext): RestResponse {
             return validationError('Validation Failed', [{ resource: 'Issue', code: 'custom', field: 'labels', message: `label ${unknown} does not exist` }]);
           }
           const issue = store.createIssue(repo, title, asString(value.body), labels);
-          return { status: 201, body: Buffer.from(issueJson(repo, issue), 'utf8') };
+          return { status: 201, body: issueResponseBody(repo, issue) };
         }
         return jsonError(404, 'Not Found');
       }
@@ -734,7 +748,7 @@ export function handleRest(ctx: RestContext): RestResponse {
       const issue = repo.issues.get(number);
       if (!issue) return jsonError(404, 'Not Found');
       if (rest.length === 2) {
-        if (method === 'GET') return { status: 200, body: Buffer.from(issueJson(repo, issue), 'utf8') };
+        if (method === 'GET') return { status: 200, body: issueResponseBody(repo, issue) };
         if (method === 'PATCH') {
           const parsed = parseJsonBody(ctx.body);
           if (!parsed.ok) return parsed.response;
@@ -747,7 +761,7 @@ export function handleRest(ctx: RestContext): RestResponse {
           }
           issue.updatedAt = store.seqTimestamp();
           store.touchIssue(issue);
-          return { status: 200, body: Buffer.from(issueJson(repo, issue), 'utf8') };
+          return { status: 200, body: issueResponseBody(repo, issue) };
         }
         return jsonError(404, 'Not Found');
       }
