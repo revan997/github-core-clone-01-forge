@@ -16,7 +16,7 @@ import (
 func handleRepoRoute(ctx RestContext, u *url.URL, owner, repoName string, rest []string, page, perPage int) RestResponse {
 	s := ctx.Store
 	method := ctx.Method
-	query := u.Query()
+	query := queryOf(u)
 
 	// GET/DELETE/PATCH /repos/:owner/:repo
 	if len(rest) == 0 {
@@ -332,7 +332,7 @@ func handleCommits(ctx RestContext, repo *store.Repo, owner, repoName string, re
 	if ctx.Method != "GET" {
 		return JSONError(404, "Not Found")
 	}
-	query := u.Query()
+	query := queryOf(u)
 	if len(rest) == 2 {
 		sha := rest[1]
 		object, ok := repo.Objects[sha]
@@ -385,6 +385,22 @@ func handleCommits(ctx RestContext, repo *store.Repo, owner, repoName string, re
 // parseIssueNumber mimics Number(rest[1]) + Number.isInteger: "1" -> 1,
 // "abc"/"1.5"/"Infinity" -> not a number, "" -> 0.
 func parseIssueNumber(s string) (int, bool) {
+	// Fast path: plain digits (the common case) skip the float parse.
+	if s != "" && len(s) <= 9 {
+		allDigits := true
+		for i := 0; i < len(s); i++ {
+			if s[i] < '0' || s[i] > '9' {
+				allDigits = false
+				break
+			}
+		}
+		if allDigits {
+			n, err := strconv.Atoi(s)
+			if err == nil {
+				return n, true
+			}
+		}
+	}
 	f, ok := jsNumber(s)
 	if !ok || f != float64(int(f)) || f < -2147483648 || f > 2147483647 {
 		return 0, false

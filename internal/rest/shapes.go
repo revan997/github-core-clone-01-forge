@@ -112,48 +112,126 @@ func orderedLabels(repo *store.Repo) []store.Label {
 	return append(out, extra...)
 }
 
-func issueShape(repo *store.Repo, issue *store.Issue) map[string]any {
-	labels := issue.Labels
-	if labels == nil {
-		labels = []store.Label{}
+// userJSON is the fixed viewer user shape. viewerLogin is constant for the
+// process, so the whole value (including the base64 node id) is computed
+// once instead of per serialization.
+type userJSON struct {
+	AvatarURL string `json:"avatar_url"`
+	HTMLURL   string `json:"html_url"`
+	ID        int    `json:"id"`
+	Login     string `json:"login"`
+	NodeID    string `json:"node_id"`
+	SiteAdmin bool   `json:"site_admin"`
+	Type      string `json:"type"`
+}
+
+var viewerUserJSON = userJSON{
+	AvatarURL: "https://github.local/avatars/" + viewerLogin,
+	HTMLURL:   "https://github.local/" + viewerLogin,
+	ID:        1000,
+	Login:     viewerLogin,
+	NodeID:    store.GlobalID("User", 1000),
+	SiteAdmin: false,
+	Type:      "User",
+}
+
+type labelJSON struct {
+	Color       string `json:"color"`
+	Default     bool   `json:"default"`
+	Description string `json:"description"`
+	ID          int    `json:"id"`
+	Name        string `json:"name"`
+	NodeID      string `json:"node_id"`
+	URL         string `json:"url"`
+}
+
+// issueJSONStruct is the serialized issue shape. Fields are declared in
+// alphabetical key order — exactly the order encoding/json emits for the
+// map-based shape it replaces — so the bytes are identical. It is encoded
+// with marshalJSON (SetEscapeHTML(false)), preserving the old escaping
+// (including the always-escaped U+2028/U+2029).
+type issueJSONStruct struct {
+	Assignee          any         `json:"assignee"`
+	Assignees         []any       `json:"assignees"`
+	AuthorAssociation string      `json:"author_association"`
+	Body              string      `json:"body"`
+	ClosedAt          *string     `json:"closed_at"`
+	Comments          int         `json:"comments"`
+	CommentsURL       string      `json:"comments_url"`
+	CreatedAt         string      `json:"created_at"`
+	EventsURL         string      `json:"events_url"`
+	HTMLURL           string      `json:"html_url"`
+	ID                int         `json:"id"`
+	Labels            []labelJSON `json:"labels"`
+	LabelsURL         string      `json:"labels_url"`
+	Locked            bool        `json:"locked"`
+	Milestone         any         `json:"milestone"`
+	NodeID            string      `json:"node_id"`
+	Number            int         `json:"number"`
+	RepositoryURL     string      `json:"repository_url"`
+	State             string      `json:"state"`
+	Title             string      `json:"title"`
+	UpdatedAt         string      `json:"updated_at"`
+	URL               string      `json:"url"`
+	User              userJSON    `json:"user"`
+}
+
+var emptyAnySlice = []any{}
+
+func issueJSONValue(repo *store.Repo, issue *store.Issue) issueJSONStruct {
+	labels := make([]labelJSON, 0, len(issue.Labels))
+	for _, l := range issue.Labels {
+		labels = append(labels, labelJSON{
+			Color:       l.Color,
+			Default:     false,
+			Description: l.Description,
+			ID:          0,
+			Name:        l.Name,
+			NodeID:      store.GlobalID("Label", l.Name),
+			URL:         "",
+		})
 	}
+	n := itoa(issue.Number)
 	base := "https://github.local/api/v3/repos/" + repo.Owner + "/" + repo.Name
-	return map[string]any{
-		"id":                 issue.Number,
-		"node_id":            issue.GlobalID,
-		"url":                base + "/issues/" + itoa(issue.Number),
-		"repository_url":     base,
-		"labels_url":         base + "/issues/" + itoa(issue.Number) + "/labels{/name}",
-		"comments_url":       base + "/issues/" + itoa(issue.Number) + "/comments",
-		"events_url":         base + "/issues/" + itoa(issue.Number) + "/events",
-		"html_url":           "https://github.local/" + repo.Owner + "/" + repo.Name + "/issues/" + itoa(issue.Number),
-		"number":             issue.Number,
-		"title":              issue.Title,
-		"user":               userShape(viewerLogin),
-		"labels":             labelShapes(labels),
-		"state":              issue.State,
-		"locked":             false,
-		"assignee":           nil,
-		"assignees":          []any{},
-		"milestone":          nil,
-		"comments":           len(issue.Comments),
-		"created_at":         issue.CreatedAt,
-		"updated_at":         issue.UpdatedAt,
-		"closed_at":          issue.ClosedAt,
-		"author_association": "OWNER",
-		"body":               issue.Body,
+	return issueJSONStruct{
+		Assignee:          nil,
+		Assignees:         emptyAnySlice,
+		AuthorAssociation: "OWNER",
+		Body:              issue.Body,
+		ClosedAt:          issue.ClosedAt,
+		Comments:          len(issue.Comments),
+		CommentsURL:       base + "/issues/" + n + "/comments",
+		CreatedAt:         issue.CreatedAt,
+		EventsURL:         base + "/issues/" + n + "/events",
+		HTMLURL:           "https://github.local/" + repo.Owner + "/" + repo.Name + "/issues/" + n,
+		ID:                issue.Number,
+		Labels:            labels,
+		LabelsURL:         base + "/issues/" + n + "/labels{/name}",
+		Locked:            false,
+		Milestone:         nil,
+		NodeID:            issue.GlobalID,
+		Number:            issue.Number,
+		RepositoryURL:     base,
+		State:             issue.State,
+		Title:             issue.Title,
+		UpdatedAt:         issue.UpdatedAt,
+		URL:               base + "/issues/" + n,
+		User:              viewerUserJSON,
 	}
 }
 
 // issueJSON is the serialized issue shape, cached on the issue (the read
 // workload hits one issue 2000x). Empty CachedJSON means "not cached".
+// The response bytes are cached alongside the string so issueResponse
+// returns them without a per-request []byte(string) copy.
 func issueJSON(repo *store.Repo, issue *store.Issue) string {
 	if issue.CachedJSON != "" {
 		return issue.CachedJSON
 	}
-	jsonText := string(marshalJSON(issueShape(repo, issue)))
-	issue.CachedJSON = jsonText
-	return jsonText
+	body := marshalJSON(issueJSONValue(repo, issue))
+	issue.CachedJSON = string(body)
+	issue.CachedBody = body
+	return issue.CachedJSON
 }
 
 // issueResponse returns the cached serialized issue body as the response.
@@ -161,7 +239,10 @@ func issueJSON(repo *store.Repo, issue *store.Issue) string {
 // is the perf feature that matters — re-serializing the shape — so the
 // outer buffer cache is deliberately not reproduced.)
 func issueResponse(repo *store.Repo, issue *store.Issue, status int) RestResponse {
-	return RestResponse{Status: status, Body: []byte(issueJSON(repo, issue))}
+	if issue.CachedBody == nil {
+		_ = issueJSON(repo, issue)
+	}
+	return RestResponse{Status: status, Body: issue.CachedBody}
 }
 
 // issueListJSON renders a page of issues from their cached JSON texts,

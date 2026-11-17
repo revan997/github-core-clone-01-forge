@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"unicode"
@@ -127,19 +128,52 @@ func sortedKeys(m map[string]bool) []string {
 	return out
 }
 
-// canonicalJSON is the collision-free key encoding: encoding/json over the
-// component values (the Go equivalent of the spec's JSON.stringify key).
-// Unlike fmt-based joins it is injective over strings — a value containing a
-// separator can never alias two separate values (the GPT review-2 fetch-cache
-// collision: haves ["tip","other"] vs ["tip,other"] must key differently).
-func canonicalJSON(v any) string {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
-		return ""
+// cacheKeyBuilder builds collision-free cache keys from length-prefixed
+// fields: every string is written as "<len>:<bytes>|", every int as
+// "<digits>|", and every list as its count followed by its elements, so no
+// value can alias a different split of values — ["tip","other"] and
+// ["tip,other"] key differently, as do ["A","B"] and ["A,B"] (the GPT
+// review-2 fetch-cache collision). It is injective over the fixed field
+// sequence of each call site, and far cheaper than encoding/json: no
+// reflection, a single strings.Builder allocation.
+type cacheKeyBuilder struct {
+	sb strings.Builder
+}
+
+func (k *cacheKeyBuilder) str(s string) {
+	k.sb.WriteString(strconv.Itoa(len(s)))
+	k.sb.WriteByte(':')
+	k.sb.WriteString(s)
+	k.sb.WriteByte('|')
+}
+
+func (k *cacheKeyBuilder) num(n int) {
+	k.sb.WriteString(strconv.Itoa(n))
+	k.sb.WriteByte('|')
+}
+
+func (k *cacheKeyBuilder) strs(ss []string) {
+	k.num(len(ss))
+	for _, s := range ss {
+		k.str(s)
 	}
-	return strings.TrimSuffix(buf.String(), "\n")
+}
+
+func (k *cacheKeyBuilder) refs(refs [][2]string) {
+	k.num(len(refs))
+	for _, r := range refs {
+		k.str(r[0])
+		k.str(r[1])
+	}
+}
+
+// v0CacheKey is the collision-free key for a v0 advertisement: service plus
+// the repo's sorted refs fingerprint.
+func v0CacheKey(service string, repo *store.Repo) string {
+	var k cacheKeyBuilder
+	k.str(service)
+	k.refs(sortedRefEntries(repo))
+	return k.sb.String()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -227,7 +261,7 @@ func buildV0Advertisement(repo *store.Repo, service string) []byte {
 }
 
 func v0Advertisement(repo *store.Repo, service string) []byte {
-	key := canonicalJSON([]any{service, sortedRefEntries(repo)})
+	key := v0CacheKey(service, repo)
 	gitCacheMu.Lock()
 	defer gitCacheMu.Unlock()
 	cache := cacheFor(v0AdvertisementCaches, repo)

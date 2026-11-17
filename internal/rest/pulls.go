@@ -12,7 +12,7 @@ import (
 func handlePulls(ctx RestContext, repo *store.Repo, owner, repoName string, rest []string, u *url.URL, page, perPage int) RestResponse {
 	s := ctx.Store
 	method := ctx.Method
-	query := u.Query()
+	query := queryOf(u)
 
 	if len(rest) == 1 {
 		if method == "GET" {

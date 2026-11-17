@@ -342,21 +342,19 @@ func parseV2FetchArgs(packets []store.PktPacket) *v2FetchArgs {
 }
 
 // fetchCacheKey is the canonical, collision-free encoding of a v2 fetch
-// response's inputs (the spec's JSON.stringify key). A want, have or shallow
-// value containing ',' can no longer collide with two separate values.
+// response's inputs. Length-prefixed fields (see cacheKeyBuilder) keep it
+// injective: a want, have or shallow value containing ',' can no longer
+// collide with two separate values. Depth is always written as an int
+// (0 = no limit); field positions are fixed, so 0 never aliases a depth.
 func fetchCacheKey(repo *store.Repo, args *v2FetchArgs) string {
-	var depthVal any
-	if args.depth != 0 {
-		depthVal = args.depth
-	}
-	return canonicalJSON([]any{
-		len(repo.Objects),
-		sortedRefEntries(repo),
-		args.wants,
-		args.haves,
-		args.shallow,
-		depthVal,
-	})
+	var k cacheKeyBuilder
+	k.num(len(repo.Objects))
+	k.refs(sortedRefEntries(repo))
+	k.strs(args.wants)
+	k.strs(args.haves)
+	k.strs(args.shallow)
+	k.num(args.depth)
+	return k.sb.String()
 }
 
 func v2FetchResponse(s *store.Store, repo *store.Repo, args *v2FetchArgs) GitResponse {

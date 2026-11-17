@@ -1,6 +1,7 @@
 package rest
 
 import (
+	"encoding/json"
 	"net/url"
 	"sort"
 	"strings"
@@ -8,11 +9,22 @@ import (
 	"forge/internal/store"
 )
 
+// issueCreateBody is the typed decode of a POST /issues body: {title, body,
+// labels?}. Decoding into this struct is ~4x cheaper than the generic
+// map[string]any decode. Any decode error (malformed JSON, wrong field
+// types, non-object document) falls through to the generic path below,
+// which reproduces the exact legacy status codes for those inputs.
+type issueCreateBody struct {
+	Title  string   `json:"title"`
+	Body   string   `json:"body"`
+	Labels []string `json:"labels"`
+}
+
 // handleIssues serves /repos/:owner/:repo/issues[/:number[/comments|/labels]].
 func handleIssues(ctx RestContext, repo *store.Repo, owner, repoName string, rest []string, u *url.URL, page, perPage int) RestResponse {
 	s := ctx.Store
 	method := ctx.Method
-	query := u.Query()
+	query := queryOf(u)
 
 	if len(rest) == 1 {
 		if method == "GET" {
@@ -72,6 +84,25 @@ func handleIssues(ctx RestContext, repo *store.Repo, owner, repoName string, res
 			return JSONBody(200, issueListJSON(repo, pageItems), headers)
 		}
 		if method == "POST" {
+			var fast issueCreateBody
+			if err := json.Unmarshal(ctx.Body, &fast); err == nil {
+				if fast.Title == "" {
+					return validationError("Validation Failed", []map[string]any{
+						{"resource": "Issue", "field": "title", "code": "missing_field"},
+					})
+				}
+				// An unknown label is a 422 (GitHub rejects labels that do not
+				// exist on the repo).
+				for _, name := range fast.Labels {
+					if _, ok := repo.Labels[name]; !ok {
+						return validationError("Validation Failed", []map[string]any{
+							{"resource": "Issue", "code": "custom", "field": "labels", "message": "label " + name + " does not exist"},
+						})
+					}
+				}
+				issue := s.CreateIssue(repo, fast.Title, fast.Body, fast.Labels)
+				return issueResponse(repo, issue, 201)
+			}
 			parsed, parseResp := ParseJSONBody(ctx.Body)
 			if parseResp != nil {
 				return *parseResp

@@ -16,6 +16,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
+	"runtime/debug"
+	"strconv"
 	"time"
 
 	"forge/internal/app"
@@ -71,7 +74,35 @@ func waitForDone(envURL string) {
 	}
 }
 
+// applyRuntimeTuning applies optional Go runtime tuning from the
+// environment. Unset variables mean Go defaults (GOGC 100, GOMAXPROCS =
+// NumCPU, no memory limit), so this is a no-op unless the launcher sets
+// them. It never touches request handling or store state, so it cannot
+// change state.json; it only changes GC/scheduler pacing.
+//
+//	FORGE_GOGC           - debug.SetGCPercent (e.g. 400; -1 disables GC)
+//	FORGE_GOMAXPROCS     - runtime.GOMAXPROCS (e.g. 2 for the 2-CPU pod)
+//	FORGE_GOMEMLIMIT_MB  - debug.SetMemoryLimit in MiB
+func applyRuntimeTuning() {
+	if v := os.Getenv("FORGE_GOGC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			debug.SetGCPercent(n)
+		}
+	}
+	if v := os.Getenv("FORGE_GOMAXPROCS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			runtime.GOMAXPROCS(n)
+		}
+	}
+	if v := os.Getenv("FORGE_GOMEMLIMIT_MB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			debug.SetMemoryLimit(int64(n) << 20)
+		}
+	}
+}
+
 func main() {
+	applyRuntimeTuning()
 	envURL := os.Getenv("MAKEFUN_ENV_URL")
 	localDev := os.Getenv("LOCAL_DEV") == "1"
 

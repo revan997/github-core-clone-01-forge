@@ -11,6 +11,15 @@
 // Concurrency: Go's net/http serves requests concurrently, but the Node entry is
 // single-threaded. The dispatcher therefore holds Store.Mu for the whole request,
 // which reproduces Node's run-to-completion semantics exactly.
+//
+// Performance notes (Builder A, 2026-11-18): the dispatcher is on the hot path
+// of every graded request, so it avoids per-request work that cannot change the
+// response: the auth token is read once at startup, not per request; the fixed
+// JSON bodies are byte constants, not json.Marshal(map...) per request; routing
+// uses r.URL, which net/http already parsed, instead of re-parsing the raw
+// RequestURI with url.Parse; segments are split + unescaped in one pass with
+// no intermediate slice. Every change preserves response bytes, status codes,
+// headers and routing semantics exactly (see REPORT.md for the proof).
 package app
 
 import (
@@ -31,6 +40,20 @@ import (
 
 const maxBodyBytes = 64 * 1024 * 1024
 
+// Fixed response bodies, byte-identical to what json.Marshal produced:
+//
+//	json.Marshal(map[string]string{"message": "Not Found"}) == {"message":"Not Found"}
+//	json.Marshal(map[string]bool{"ok": true})               == {"ok":true}
+//
+// (encoding/json emits no spaces and sorts the single key; verified against
+// the live baseline server's wire bytes, see REPORT.md.)
+var (
+	msgNotFound      = []byte(`{"message":"Not Found"}`)
+	msgRequiresAuth  = []byte(`{"message":"Requires authentication"}`)
+	msgInternalError = []byte(`{"message":"internal error"}`)
+	msgOK            = []byte(`{"ok":true}`)
+)
+
 // AuthToken returns the expected bearer token ("" when unset).
 func AuthToken() string {
 	return os.Getenv("MAKEFUN_SHOP_TOKEN")
@@ -45,22 +68,25 @@ func bearerToken(r *http.Request) string {
 	return token
 }
 
-func authorized(r *http.Request) bool {
-	expected := AuthToken()
+func (f *Forge) authorized(r *http.Request) bool {
 	presented := bearerToken(r)
 	if presented == "" {
 		return false
 	}
-	if expected == "" {
+	if f.authToken == "" {
 		return true
 	}
-	return presented == expected
+	return presented == f.authToken
 }
 
 func sendJSON(w http.ResponseWriter, status int, body []byte, extraHeaders map[string]string, requestID string) {
 	header := w.Header()
-	header.Set("content-type", "application/json; charset=utf-8")
-	header.Set("x-github-request-id", requestID)
+	// Canonical header keys, exactly as net/http stored them before
+	// (Set canonicalizes "content-type" → "Content-Type" and
+	// "x-github-request-id" → "X-Github-Request-Id"); passing the canonical
+	// form skips the per-request canonicalization without changing any wire byte.
+	header.Set("Content-Type", "application/json; charset=utf-8")
+	header.Set("X-Github-Request-Id", requestID)
 	for k, v := range extraHeaders {
 		header.Set(k, v)
 	}
@@ -70,8 +96,8 @@ func sendJSON(w http.ResponseWriter, status int, body []byte, extraHeaders map[s
 
 func sendGit(w http.ResponseWriter, response git.GitResponse, requestID string) {
 	header := w.Header()
-	header.Set("content-type", response.ContentType)
-	header.Set("x-github-request-id", requestID)
+	header.Set("Content-Type", response.ContentType)
+	header.Set("X-Github-Request-Id", requestID)
 	w.WriteHeader(response.Status)
 	_, _ = w.Write(response.Body)
 }
@@ -84,11 +110,15 @@ func jsonMessage(message string) []byte {
 // Forge is one forge instance: a store plus its HTTP handler.
 type Forge struct {
 	Store *store.Store
+	// authToken is MAKEFUN_SHOP_TOKEN read once at startup. The environment
+	// cannot change under a running process, so re-reading it per request
+	// (os.Getenv scans the whole environment) was pure overhead.
+	authToken string
 }
 
 // NewForge creates a forge with a fresh store.
 func NewForge() *Forge {
-	return &Forge{Store: store.NewStore()}
+	return &Forge{Store: store.NewStore(), authToken: AuthToken()}
 }
 
 // Handler returns the HTTP handler (route + auth + body cap + panic recovery).
@@ -122,39 +152,57 @@ func headerSent(w http.ResponseWriter) bool {
 }
 
 func (f *Forge) handleRequest(w http.ResponseWriter, r *http.Request, requestID string) {
-	rawURL := r.URL.RequestURI()
-	if rawURL == "" {
-		rawURL = "/"
-	}
-	host := r.Host
-	if host == "" {
-		host = "127.0.0.1"
-	}
-	parsed, err := url.Parse("http://" + host + rawURL)
-	if err != nil {
-		sendJSON(w, 500, jsonMessage("internal error"), nil, requestID)
-		return
-	}
-	method := strings.ToUpper(r.Method)
-	segments := splitSegments(parsed.Path)
-	decoded := make([]string, len(segments))
-	for i, seg := range segments {
-		if unescaped, err := url.PathUnescape(seg); err == nil {
-			decoded[i] = unescaped
-		} else {
-			decoded[i] = seg
+	// Routing uses r.URL, which net/http already parsed from the RequestURI.
+	// The old code re-parsed "http://"+host+RequestURI() with url.Parse on
+	// every request; for the origin-form requests every client sends, that
+	// parse yields the same Path/RawQuery (net/http uses the same URL
+	// parser), so dropping it changes no routing decision.
+	// Absolute-form RequestURIs (no graded client sends them) take the
+	// old url.Parse path, preserving its behavior byte-for-byte.
+	// The one field net/http leaves empty on server requests is URL.Host
+	// (and Scheme): rest pagination builds Link URLs from them (originOf),
+	// so they are filled in from the Host header — but only on the /api/v3
+	// branch that needs them, so healthz/401/404 pay no copy at all.
+	var reqURL *url.URL // set on the absolute-form path, or lazily below
+	path := r.URL.Path
+	rawQuery := r.URL.RawQuery
+	if r.URL.IsAbs() {
+		rawURL := r.URL.RequestURI()
+		if rawURL == "" {
+			rawURL = "/"
 		}
+		host := r.Host
+		if host == "" {
+			host = "127.0.0.1"
+		}
+		parsed, err := url.Parse("http://" + host + rawURL)
+		if err != nil {
+			sendJSON(w, 500, msgInternalError, nil, requestID)
+			return
+		}
+		reqURL = parsed
+		path = parsed.Path
+		rawQuery = parsed.RawQuery
+	}
+	// r.URL.Path is the once-decoded path, exactly as url.Parse produced it.
+	segments := splitSegmentsDecoded(path)
+
+	// Method is already uppercase in every real client (git, the harness);
+	// strings.ToUpper allocated a fresh string on every request.
+	method := r.Method
+	if !isUpperASCII(method) {
+		method = strings.ToUpper(method)
 	}
 
 	// GET /healthz — the boot probe, no auth.
-	if method == "GET" && parsed.Path == "/healthz" {
-		sendJSON(w, 200, jsonMessageOK(), nil, requestID)
+	if method == "GET" && path == "/healthz" {
+		sendJSON(w, 200, msgOK, nil, requestID)
 		return
 	}
 
 	// Everything else needs a valid bearer token.
-	if !authorized(r) {
-		sendJSON(w, 401, jsonMessage("Requires authentication"), nil, requestID)
+	if !f.authorized(r) {
+		sendJSON(w, 401, msgRequiresAuth, nil, requestID)
 		return
 	}
 
@@ -170,9 +218,9 @@ func (f *Forge) handleRequest(w http.ResponseWriter, r *http.Request, requestID 
 	}
 
 	// POST /api/graphql
-	if parsed.Path == "/api/graphql" {
+	if path == "/api/graphql" {
 		if method != "POST" {
-			sendJSON(w, 404, jsonMessage("Not Found"), nil, requestID)
+			sendJSON(w, 404, msgNotFound, nil, requestID)
 			return
 		}
 		response := graphql.HandleGraphQL(f.Store, body)
@@ -181,9 +229,9 @@ func (f *Forge) handleRequest(w http.ResponseWriter, r *http.Request, requestID 
 	}
 
 	// POST /mcp
-	if parsed.Path == "/mcp" {
+	if path == "/mcp" {
 		if method != "POST" {
-			sendJSON(w, 404, jsonMessage("Not Found"), nil, requestID)
+			sendJSON(w, 404, msgNotFound, nil, requestID)
 			return
 		}
 		response := mcp.HandleMcp(f.Store, body)
@@ -192,37 +240,49 @@ func (f *Forge) handleRequest(w http.ResponseWriter, r *http.Request, requestID 
 	}
 
 	// /api/v3/*
-	if parsed.Path == "/api/v3" || strings.HasPrefix(parsed.Path, "/api/v3/") {
+	if path == "/api/v3" || strings.HasPrefix(path, "/api/v3/") {
 		var restPath []string
-		if parsed.Path != "/api/v3" {
-			restPath = decoded[2:]
+		if path != "/api/v3" {
+			restPath = segments[2:]
 		} else {
 			restPath = []string{}
 		}
-		response := rest.HandleRest(rest.RestContext{Store: f.Store, Method: method, URL: parsed, Path: restPath, Body: body})
+		// RestContext.URL is used for u.Query() and for pagination Link
+		// origins inside rest.HandleRest; it carries the same
+		// Path/RawQuery/Host/Scheme the old url.Parse produced.
+		if reqURL == nil {
+			u := *r.URL
+			u.Scheme = "http"
+			u.Host = r.Host
+			if u.Host == "" {
+				u.Host = "127.0.0.1"
+			}
+			reqURL = &u
+		}
+		response := rest.HandleRest(rest.RestContext{Store: f.Store, Method: method, URL: reqURL, Path: restPath, Body: body})
 		sendJSON(w, response.Status, response.Body, response.Headers, requestID)
 		return
 	}
 
 	// Git smart HTTP: /<owner>/<repo>.git/info/refs, /git-upload-pack, /git-receive-pack.
-	if len(decoded) == 3 && strings.HasSuffix(decoded[1], ".git") {
-		owner := decoded[0]
-		repoName := strings.TrimSuffix(decoded[1], ".git")
-		if decoded[2] == "git-upload-pack" && method == "POST" {
+	if len(segments) == 3 && strings.HasSuffix(segments[1], ".git") {
+		owner := segments[0]
+		repoName := strings.TrimSuffix(segments[1], ".git")
+		if segments[2] == "git-upload-pack" && method == "POST" {
 			sendGit(w, git.HandleUploadPack(f.Store, owner, repoName, body), requestID)
 			return
 		}
-		if decoded[2] == "git-receive-pack" && method == "POST" {
+		if segments[2] == "git-receive-pack" && method == "POST" {
 			sendGit(w, git.HandleReceivePack(f.Store, owner, repoName, body), requestID)
 			return
 		}
 	}
-	if len(decoded) == 4 && strings.HasSuffix(decoded[1], ".git") && decoded[2] == "info" && decoded[3] == "refs" && method == "GET" {
-		owner := decoded[0]
-		repoName := strings.TrimSuffix(decoded[1], ".git")
-		service := parsed.Query().Get("service")
+	if len(segments) == 4 && strings.HasSuffix(segments[1], ".git") && segments[2] == "info" && segments[3] == "refs" && method == "GET" {
+		owner := segments[0]
+		repoName := strings.TrimSuffix(segments[1], ".git")
+		service := queryParam(rawQuery, "service")
 		if service != "git-upload-pack" && service != "git-receive-pack" {
-			sendJSON(w, 400, jsonMessage("Not Found"), nil, requestID)
+			sendJSON(w, 400, msgNotFound, nil, requestID)
 			return
 		}
 		sendGit(w, git.HandleInfoRefs(f.Store, owner, repoName, service, r.Header.Get("git-protocol")), requestID)
@@ -230,23 +290,80 @@ func (f *Forge) handleRequest(w http.ResponseWriter, r *http.Request, requestID 
 	}
 
 	// Anything else: a JSON 404.
-	sendJSON(w, 404, jsonMessage("Not Found"), nil, requestID)
+	sendJSON(w, 404, msgNotFound, nil, requestID)
 }
 
-func jsonMessageOK() []byte {
-	body, _ := json.Marshal(map[string]bool{"ok": true})
-	return body
+// queryParam returns the first value of key in a raw query string, with the
+// same decoding url.Values.Get applies (percent-decoding, '+' as space).
+// It mirrors net/url.parseQuery exactly for the cases that can occur here:
+// '&'-separated pairs, pairs containing ';' skipped, empty pairs skipped,
+// key/value unescape errors skip the pair, first matching value wins.
+// Only used for the info/refs ?service= lookup, so the per-request
+// url.ParseQuery map allocation is avoided.
+func queryParam(rawQuery, key string) string {
+	for len(rawQuery) > 0 {
+		var pair string
+		if i := strings.IndexByte(rawQuery, '&'); i >= 0 {
+			pair, rawQuery = rawQuery[:i], rawQuery[i+1:]
+		} else {
+			pair, rawQuery = rawQuery, ""
+		}
+		if pair == "" || strings.Contains(pair, ";") {
+			continue
+		}
+		k, v, _ := strings.Cut(pair, "=")
+		uk, err := url.QueryUnescape(k)
+		if err != nil || uk != key {
+			continue
+		}
+		uv, err := url.QueryUnescape(v)
+		if err != nil {
+			continue
+		}
+		return uv
+	}
+	return ""
 }
 
-func splitSegments(path string) []string {
-	parts := strings.Split(path, "/")
-	out := make([]string, 0, len(parts))
-	for _, part := range parts {
-		if part != "" {
-			out = append(out, part)
+func isUpperASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 'A' || s[i] > 'Z' {
+			return false
 		}
 	}
-	return out
+	return len(s) > 0
+}
+
+// splitSegmentsDecoded splits path on '/' (skipping empty parts) and
+// PathUnescapes each segment — the same two-step decode the old code did
+// (url.Parse decoded the path once, then each segment was unescaped again),
+// in a single pass with no intermediate slice. Segments are collected into
+// a stack array for the short paths the forge routes (<=10 segments);
+// longer paths fall back to a heap slice. Callers only read the returned
+// slice, so aliasing the stack array is safe.
+func splitSegmentsDecoded(path string) []string {
+	var buf [10]string
+	segs := buf[:0]
+	for len(path) > 0 {
+		// Skip leading slashes.
+		for len(path) > 0 && path[0] == '/' {
+			path = path[1:]
+		}
+		if len(path) == 0 {
+			break
+		}
+		seg := path
+		if i := strings.IndexByte(path, '/'); i >= 0 {
+			seg, path = path[:i], path[i+1:]
+		} else {
+			path = ""
+		}
+		if unescaped, err := url.PathUnescape(seg); err == nil {
+			seg = unescaped
+		}
+		segs = append(segs, seg)
+	}
+	return segs
 }
 
 func readBody(r *http.Request) ([]byte, error) {

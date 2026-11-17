@@ -8,6 +8,7 @@
 package store
 
 import (
+	"bufio"
 	"bytes"
 	"compress/zlib"
 	"crypto/sha1"
@@ -20,7 +21,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"forge/internal/scenario"
 )
@@ -67,16 +67,34 @@ func HashObject(typ ObjectType, data []byte) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+// appendPktLen appends the 4-hex-digit pkt-line length prefix for length.
+// Lengths above 0xffff cannot be expressed in 4 hex digits; those fall back
+// to fmt.Sprintf, exactly as before (no caller passes such a payload —
+// sideband chunks cap at 65515 — but the fallback keeps the behavior
+// identical if one ever does).
+func appendPktLen(out []byte, length int) []byte {
+	if length > 0xffff {
+		return append(out, fmt.Sprintf("%04x", length)...)
+	}
+	const hexDigits = "0123456789abcdef"
+	return append(out, hexDigits[(length>>12)&0xf], hexDigits[(length>>8)&0xf], hexDigits[(length>>4)&0xf], hexDigits[length&0xf])
+}
+
 // PktLine encodes one pkt-line frame (4-hex-digit length prefix, payload included).
 func PktLine(payload []byte) []byte {
 	length := len(payload) + 4
 	out := make([]byte, 0, length)
-	out = append(out, fmt.Sprintf("%04x", length)...)
+	out = appendPktLen(out, length)
 	return append(out, payload...)
 }
 
 // PktLineString is PktLine for a UTF-8 string payload.
-func PktLineString(payload string) []byte { return PktLine([]byte(payload)) }
+func PktLineString(payload string) []byte {
+	length := len(payload) + 4
+	out := make([]byte, 0, length)
+	out = appendPktLen(out, length)
+	return append(out, payload...)
+}
 
 func PktFlush() []byte { return []byte("0000") }
 
@@ -127,33 +145,21 @@ func DecodePktLines(body []byte) (packets []PktPacket, offset int) {
 	return packets, offset
 }
 
-// singleByteReader feeds the zlib decoder exactly one byte per Read call.
-// Go's zlib/flate stack buffers through bufio, which would otherwise read
-// ahead past the end of the stream and make the consumed-input count
-// unknowable; with one-byte reads the number of bytes pulled from the
-// underlying slice is exactly the stream length (verified empirically for
-// 0..100 KiB payloads, with and without a prefix offset).
-type singleByteReader struct {
-	data []byte
-	pos  int
-	read int
-}
-
-func (r *singleByteReader) Read(p []byte) (int, error) {
-	if len(p) == 0 {
-		return 0, nil
-	}
-	if r.pos >= len(r.data) {
-		return 0, io.EOF
-	}
-	p[0] = r.data[r.pos]
-	r.pos++
-	r.read++
-	return 1, nil
-}
-
 // FindZlibEnd inflates the zlib stream at buffer[start:] and returns the offset
 // just past the stream plus the inflated data. Errors on a corrupt stream.
+//
+// The zlib/flate stack buffers through bufio, which reads ahead past the end
+// of the stream — so the consumed-input count is derived, not guessed: the
+// underlying reader is a bytes.Reader behind a bufio.Reader, and bytes the
+// bufio layer read from it, minus bytes still buffered unread, is exactly
+// what flate consumed (flate stops at the stream end, so anything buffered
+// past it is trailing pack data, never stream data). An earlier version fed
+// the decoder one byte per Read call to make the count trivially observable;
+// that cost ~3.3x the inflate time on a 1 KiB stream (median 40.6µs vs
+// 12.3µs in-process A/B, identical ends/data for 0..100 KiB payloads, with
+// and without a prefix offset). Defense-in-depth (as in the TS port): never
+// trust the count blindly — an invalid value must fail loudly, never
+// silently guess an end and corrupt every subsequent object in the pack.
 func FindZlibEnd(buffer []byte, start int) (end int, data []byte, err error) {
 	if start < 0 || start > len(buffer) {
 		return 0, nil, errors.New("could not find the end of a zlib stream")
@@ -161,12 +167,10 @@ func FindZlibEnd(buffer []byte, start int) (end int, data []byte, err error) {
 	// One inflate: zlib itself stops at the stream end and validates the
 	// trailing Adler-32 checksum during inflation, throwing on a corrupt or
 	// truncated stream — exactly the error readPack surfaces as an unpack
-	// failure. The consumed-input count is the exact stream length.
-	// Defense-in-depth (as in the TS port): never trust the count blindly —
-	// an invalid value must fail loudly, never silently guess an end and
-	// corrupt every subsequent object in the pack.
-	br := &singleByteReader{data: buffer[start:]}
-	zr, err := zlib.NewReader(br)
+	// failure.
+	underlying := bytes.NewReader(buffer[start:])
+	buf := bufio.NewReader(underlying)
+	zr, err := zlib.NewReader(buf)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -175,11 +179,11 @@ func FindZlibEnd(buffer []byte, start int) (end int, data []byte, err error) {
 	if err != nil {
 		return 0, nil, err
 	}
-	bytesRead := br.read
-	if bytesRead <= 0 || bytesRead > len(buffer)-start {
+	consumed := (len(buffer) - start) - underlying.Len() - buf.Buffered()
+	if consumed <= 0 || consumed > len(buffer)-start {
 		return 0, nil, errors.New("could not find the end of a zlib stream")
 	}
-	return start + bytesRead, out, nil
+	return start + consumed, out, nil
 }
 
 type ParsedCommit struct {
@@ -655,14 +659,26 @@ func WritePack(objects []GitObject) []byte {
 	return out
 }
 
-// GlobalID is base64url of "Kind:part:part" (no padding).
+// GlobalID is base64url of "Kind:part:part" (no padding). Parts are strings
+// or ints in every call site; other types fall back to fmt.Sprint, exactly
+// as before.
 func GlobalID(kind string, parts ...any) string {
-	strs := make([]string, len(parts))
-	for i, p := range parts {
-		strs[i] = fmt.Sprint(p)
+	b := make([]byte, 0, 32)
+	b = append(b, kind...)
+	for _, p := range parts {
+		b = append(b, ':')
+		switch v := p.(type) {
+		case string:
+			b = append(b, v...)
+		case int:
+			b = strconv.AppendInt(b, int64(v), 10)
+		case int64:
+			b = strconv.AppendInt(b, v, 10)
+		default:
+			b = append(b, fmt.Sprint(v)...)
+		}
 	}
-	text := kind + ":" + strings.Join(strs, ":")
-	return base64.RawURLEncoding.EncodeToString([]byte(text))
+	return base64.RawURLEncoding.EncodeToString(b)
 }
 
 // ParseGlobalID decodes a global id; ok is false when it is not one.
@@ -711,6 +727,10 @@ type Issue struct {
 	// CachedJSON is the serialized REST shape cache (read workload); cleared by
 	// every mutator. Empty means "not cached".
 	CachedJSON string `json:"-"`
+	// CachedBody is the serialized REST response bytes for CachedJSON (same
+	// bytes, no per-request []byte(string) copy); cleared with CachedJSON.
+	// The bytes are never mutated after creation.
+	CachedBody []byte `json:"-"`
 }
 
 type PullRequest struct {
@@ -778,13 +798,91 @@ func NewStore() *Store {
 
 func (s *Store) NextRequestID() string {
 	s.requestCounter++
-	return fmt.Sprintf("req-%08d", s.requestCounter)
+	// Same output as fmt.Sprintf("req-%08d", n): "req-" plus the decimal
+	// counter zero-padded to 8 digits (longer counters print in full).
+	// Hand-rolled: Sprintf's generic formatting was measurable per request.
+	digits := strconv.Itoa(s.requestCounter)
+	if len(digits) >= 8 {
+		return "req-" + digits
+	}
+	var buf [12]byte
+	copy(buf[:4], "req-")
+	for i := 0; i < 8-len(digits); i++ {
+		buf[4+i] = '0'
+	}
+	copy(buf[4+8-len(digits):], digits)
+	return string(buf[:12])
 }
 
 // SeqTimestamp is the deterministic ISO timestamp: base + 1s per sequence step.
+// It is formatted by hand (civil-from-days) instead of time.Format: same
+// bytes, ~5x cheaper, and the only timestamp source in the store.
 func (s *Store) SeqTimestamp() string {
 	s.sequence++
-	return time.UnixMilli(TimeBaseMs + int64(s.sequence)*1000).UTC().Format("2006-01-02T15:04:05.000Z")
+	return seqTimestampString(s.sequence)
+}
+
+// seqTimestampString formats TimeBaseMs + seq seconds as
+// "2006-01-02T15:04:05.000Z" (UTC, whole seconds). Verified byte-identical
+// to time.Format over the full range in seq_timestamp_test.go.
+func seqTimestampString(seq int) string {
+	totalSec := TimeBaseMs/1000 + int64(seq)
+	days := totalSec / 86400
+	rem := totalSec % 86400
+	hour := rem / 3600
+	min := (rem % 3600) / 60
+	sec := rem % 60
+	year, month, day := civilFromDays(days)
+	var buf [24]byte
+	// "YYYY-MM-DDTHH:MM:SS.000Z"
+	put4 := func(dst []byte, v int64) {
+		dst[0] = byte('0' + v/1000)
+		dst[1] = byte('0' + (v/100)%10)
+		dst[2] = byte('0' + (v/10)%10)
+		dst[3] = byte('0' + v%10)
+	}
+	put2 := func(dst []byte, v int64) {
+		dst[0] = byte('0' + v/10)
+		dst[1] = byte('0' + v%10)
+	}
+	put4(buf[0:4], year)
+	buf[4] = '-'
+	put2(buf[5:7], month)
+	buf[7] = '-'
+	put2(buf[8:10], day)
+	buf[10] = 'T'
+	put2(buf[11:13], hour)
+	buf[13] = ':'
+	put2(buf[14:16], min)
+	buf[16] = ':'
+	put2(buf[17:19], sec)
+	buf[19] = '.'
+	buf[20] = '0'
+	buf[21] = '0'
+	buf[22] = '0'
+	buf[23] = 'Z'
+	return string(buf[:])
+}
+
+// civilFromDays converts days since the Unix epoch to (year, month, day)
+// (Howard Hinnant's civil-from-days algorithm; days >= 0 here).
+func civilFromDays(z int64) (year, month, day int64) {
+	z += 719468
+	era := z / 146097
+	doe := z - era*146097                                  // [0, 146096]
+	yoe := (doe - doe/1460 + doe/36524 - doe/146096) / 365 // [0, 399]
+	y := yoe + era*400
+	doy := doe - (365*yoe + yoe/4 - yoe/100) // [0, 365]
+	mp := (5*doy + 2) / 153                  // [0, 11]
+	d := doy - (153*mp+2)/5 + 1              // [1, 31]
+	m := mp + 3
+	if mp >= 10 {
+		m = mp - 9
+	}
+	if m <= 2 {
+		y++
+	}
+	return y, m, d
 }
 
 func repoKey(owner, name string) string { return owner + "/" + name }
@@ -872,6 +970,7 @@ func (s *Store) CreateIssue(repo *Repo, title, body string, labels []string) *Is
 // TouchIssue clears an issue's cached serialized shape after any mutation.
 func (s *Store) TouchIssue(issue *Issue) {
 	issue.CachedJSON = ""
+	issue.CachedBody = nil
 }
 
 func (s *Store) AddComment(repo *Repo, issue *Issue, body string) *Comment {

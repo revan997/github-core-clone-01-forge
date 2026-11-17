@@ -8,7 +8,14 @@ import { fileURLToPath } from "node:url";
 const folder = dirname(fileURLToPath(import.meta.url));
 const binary = join(folder, "forge-go-bin");
 
-const child = spawn(binary, process.argv.slice(2), { stdio: "inherit" });
+const child = spawn(binary, process.argv.slice(2), {
+  stdio: "inherit",
+  // Runtime tuning (Builder D, profile-guided): GOGC 400 = fewer GC
+  // cycles; GOMAXPROCS 2 = the trial pod's CPU count. Both are pure
+  // GC/scheduler pacing — they cannot change any response byte or
+  // state.json. See REPORT.md for the A/B evidence.
+  env: { ...process.env, FORGE_GOGC: "400", FORGE_GOMAXPROCS: "2" },
+});
 
 let done = false;
 
