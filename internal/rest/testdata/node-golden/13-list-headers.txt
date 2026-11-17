@@ -1,0 +1,9 @@
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+x-github-request-id: req-00000013
+link: <http://127.0.0.1:41365/api/v3/repos/adaiversen/golden-repo/issues?per_page=2&page=2>; rel="last", <http://127.0.0.1:41365/api/v3/repos/adaiversen/golden-repo/issues?per_page=2&page=1>; rel="first", <http://127.0.0.1:41365/api/v3/repos/adaiversen/golden-repo/issues?per_page=2&page=1>; rel="prev"
+Date: Tue, 17 Nov 2026 07:16:23 GMT
+Connection: keep-alive
+Keep-Alive: timeout=5
+Transfer-Encoding: chunked
+
