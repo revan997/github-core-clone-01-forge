@@ -135,12 +135,22 @@ func NewForge() *Forge {
 }
 
 // Handler returns the HTTP handler (route + auth + body cap + panic recovery).
-// The store mutex is held for the whole request.
+// Locking: git-upload-pack (clone) is read-only, so concurrent clones take
+// the store's read lock and run in parallel — the clone benchmark sends 50
+// concurrent clones, and serializing them behind the write lock made the
+// round the sum of 50 handler times. Every other request takes the write
+// lock, preserving Node's run-to-completion semantics exactly. The request
+// ID is atomic (no lock needed) so concurrent clones each get a unique ID.
 func (f *Forge) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		f.Store.Mu.Lock()
-		defer f.Store.Mu.Unlock()
 		requestID := f.Store.NextRequestID()
+		if isUploadPack(r) {
+			f.Store.Mu.RLock()
+			defer f.Store.Mu.RUnlock()
+		} else {
+			f.Store.Mu.Lock()
+			defer f.Store.Mu.Unlock()
+		}
 		defer func() {
 			if rec := recover(); rec != nil {
 				detail := fmt.Sprintf("%v", rec)
@@ -151,6 +161,19 @@ func (f *Forge) Handler() http.Handler {
 		}()
 		f.handleRequest(w, r, requestID)
 	})
+}
+
+// isUploadPack reports whether r is a git-upload-pack (clone) request:
+// POST /<owner>/<repo>.git/git-upload-pack. The clone benchmark issues 50
+// of these concurrently and the handler is read-only (it builds a pack
+// from the repo's objects without mutating the store), so it is safe to
+// run them under the read lock.
+func isUploadPack(r *http.Request) bool {
+	if r.Method != "POST" {
+		return false
+	}
+	segments := splitSegmentsDecoded(r.URL.Path)
+	return len(segments) == 3 && strings.HasSuffix(segments[1], ".git") && segments[2] == "git-upload-pack"
 }
 
 // headerSent reports whether the response headers have already been written.

@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"forge/internal/scenario"
 )
@@ -782,12 +783,17 @@ var DefaultLabels = []Label{
 }
 
 type Store struct {
-	Mu sync.Mutex
+	// Mu guards the store. It is an RWMutex: the git-upload-pack (clone)
+	// path is read-only, so concurrent clones take the read lock and run
+	// in parallel; every other request takes the write lock, preserving
+	// Node's run-to-completion semantics. Store methods assume the caller
+	// (the app dispatcher) holds Mu (read or write) for the whole request.
+	Mu sync.RWMutex
 
 	Repos map[string]*Repo
 
 	nextDBID       int
-	requestCounter int
+	requestCounter int64
 	sequence       int
 	nextCommentID  int
 }
@@ -797,11 +803,13 @@ func NewStore() *Store {
 }
 
 func (s *Store) NextRequestID() string {
-	s.requestCounter++
+	// Atomic: concurrent clone requests (read lock) each need a unique ID
+	// without taking the write lock. The ID format is unchanged.
+	n := atomic.AddInt64(&s.requestCounter, 1)
 	// Same output as fmt.Sprintf("req-%08d", n): "req-" plus the decimal
 	// counter zero-padded to 8 digits (longer counters print in full).
 	// Hand-rolled: Sprintf's generic formatting was measurable per request.
-	digits := strconv.Itoa(s.requestCounter)
+	digits := strconv.FormatInt(n, 10)
 	if len(digits) >= 8 {
 		return "req-" + digits
 	}
