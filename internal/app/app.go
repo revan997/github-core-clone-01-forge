@@ -29,6 +29,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 
 	"forge/internal/git"
@@ -87,6 +88,13 @@ func sendJSON(w http.ResponseWriter, status int, body []byte, extraHeaders map[s
 	// form skips the per-request canonicalization without changing any wire byte.
 	header.Set("Content-Type", "application/json; charset=utf-8")
 	header.Set("X-Github-Request-Id", requestID)
+	// The body is fully buffered, so its length is known: send an explicit
+	// Content-Length instead of letting net/http fall back to chunked
+	// transfer encoding for bodies over 2 KiB. Same response bytes and
+	// status; only the framing changes (no chunk headers for the client
+	// to parse, and keep-alive reuse needs no chunked trailer handling).
+	// This matters most for the large JSON lists on the read/write path.
+	header.Set("Content-Length", strconv.Itoa(len(body)))
 	for k, v := range extraHeaders {
 		header.Set(k, v)
 	}
@@ -98,6 +106,11 @@ func sendGit(w http.ResponseWriter, response git.GitResponse, requestID string) 
 	header := w.Header()
 	header.Set("Content-Type", response.ContentType)
 	header.Set("X-Github-Request-Id", requestID)
+	// Same as sendJSON: git pack / info/refs bodies are fully buffered,
+	// so an explicit Content-Length avoids chunked framing on the
+	// push/clone path, where bodies are large and every chunk costs the
+	// harness client a parse step.
+	header.Set("Content-Length", strconv.Itoa(len(response.Body)))
 	w.WriteHeader(response.Status)
 	_, _ = w.Write(response.Body)
 }
