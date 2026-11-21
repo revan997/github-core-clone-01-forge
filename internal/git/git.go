@@ -210,7 +210,7 @@ func (c *boundedCache) put(key string, value []byte) {
 	c.entries[key] = value
 }
 
-var gitCacheMu sync.Mutex
+var gitCacheMu sync.RWMutex
 var v0AdvertisementCaches = map[*store.Repo]*boundedCache{}
 var fetchResponseCaches = map[*store.Repo]*boundedCache{}
 
@@ -262,14 +262,24 @@ func buildV0Advertisement(repo *store.Repo, service string) []byte {
 
 func v0Advertisement(repo *store.Repo, service string) []byte {
 	key := v0CacheKey(service, repo)
-	gitCacheMu.Lock()
-	defer gitCacheMu.Unlock()
-	cache := cacheFor(v0AdvertisementCaches, repo)
-	if hit, ok := cache.get(key); ok {
+	// Read path: shared lock — concurrent info/refs hits (e.g. 50 clones
+	// advertising the same refs) must not serialize on an exclusive mutex.
+	gitCacheMu.RLock()
+	cache, ok := v0AdvertisementCaches[repo]
+	var hit []byte
+	var found bool
+	if ok {
+		hit, found = cache.get(key)
+	}
+	gitCacheMu.RUnlock()
+	if found {
 		return hit
 	}
 	body := buildV0Advertisement(repo, service)
+	gitCacheMu.Lock()
+	cache = cacheFor(v0AdvertisementCaches, repo)
 	cache.put(key, body)
+	gitCacheMu.Unlock()
 	return body
 }
 

@@ -369,13 +369,20 @@ func v2FetchResponse(s *store.Store, repo *store.Repo, args *v2FetchArgs) GitRes
 	// fingerprint, so any mutation forces a recompute. Bounded to 32 entries
 	// per repo. The cached body is never mutated after creation.
 	key := fetchCacheKey(repo, args)
-	gitCacheMu.Lock()
-	cache := cacheFor(fetchResponseCaches, repo)
-	if hit, ok := cache.get(key); ok {
-		gitCacheMu.Unlock()
+	// Read path: shared lock — the graded clone workload is 50 concurrent
+	// identical fetches, all cache hits; they must not serialize on an
+	// exclusive mutex just to read the cache. Map reads only under RLock.
+	gitCacheMu.RLock()
+	cache, ok := fetchResponseCaches[repo]
+	var hit []byte
+	var found bool
+	if ok {
+		hit, found = cache.get(key)
+	}
+	gitCacheMu.RUnlock()
+	if found {
 		return GitResponse{Status: 200, ContentType: "application/x-git-upload-pack-result", Body: hit}
 	}
-	gitCacheMu.Unlock()
 	plan := planFetch(s, repo, args.wants, args.haves, args.shallow, args.depth)
 	var parts [][]byte
 	// acknowledgments
@@ -412,6 +419,7 @@ func v2FetchResponse(s *store.Store, repo *store.Repo, args *v2FetchArgs) GitRes
 	parts = append(parts, store.PktFlush())
 	body := bytes.Join(parts, nil)
 	gitCacheMu.Lock()
+	cache = cacheFor(fetchResponseCaches, repo)
 	cache.put(key, body)
 	gitCacheMu.Unlock()
 	return GitResponse{Status: 200, ContentType: "application/x-git-upload-pack-result", Body: body}
