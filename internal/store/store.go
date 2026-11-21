@@ -63,7 +63,11 @@ func IsObjectID(value string) bool {
 
 func HashObject(typ ObjectType, data []byte) string {
 	h := sha1.New()
-	fmt.Fprintf(h, "%s %d\x00", string(typ), len(data))
+	io.WriteString(h, string(typ))
+	io.WriteString(h, " ")
+	var numbuf [20]byte
+	h.Write(strconv.AppendInt(numbuf[:0], int64(len(data)), 10))
+	h.Write([]byte{0})
 	h.Write(data)
 	return hex.EncodeToString(h.Sum(nil))
 }
@@ -646,18 +650,13 @@ func WritePack(objects []GitObject) []byte {
 			remaining >>= 7
 		}
 		parts.Write(headerBytes)
-		var compressed bytes.Buffer
-		zw := zlib.NewWriter(&compressed)
+		zw := zlib.NewWriter(&parts)
 		zw.Write(k.object.Data)
 		zw.Close()
-		parts.Write(compressed.Bytes())
 	}
-	withoutTrailer := parts.Bytes()
-	trailer := sha1.Sum(withoutTrailer)
-	out := make([]byte, 0, len(withoutTrailer)+20)
-	out = append(out, withoutTrailer...)
-	out = append(out, trailer[:]...)
-	return out
+	trailer := sha1.Sum(parts.Bytes())
+	parts.Write(trailer[:])
+	return parts.Bytes()
 }
 
 // GlobalID is base64url of "Kind:part:part" (no padding). Parts are strings
